@@ -633,7 +633,6 @@ float getLastAccelNoiseInflation()  const; // R multiplier, last fused sample
 void resetPositionTo        (const Vector3f &position_ned, float variance);
 void resetVelocityTo        (const Vector3f &velocity_ned, float variance);
 void resetVerticalPositionTo(float down_m, float variance);
-void injectErrorState       (const float dx[ESEKF_STATE_DIM]);
 ```
 
 ### Covariance, process and measurement noise
