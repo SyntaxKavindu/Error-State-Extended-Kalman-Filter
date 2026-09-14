@@ -20,6 +20,13 @@
  *
  * Requirements on the toolchain: a C++11 freestanding implementation with
  * <cmath> and <cstring>. No dynamic allocation, no exceptions, no RTTI.
+ *
+ * SHARED HEADER. This file and the three types it includes are carried
+ * verbatim by the standalone Error-State-Extended-Kalman-Filter and
+ * Accel-Mag-Calibrators repositories as well as by this project, so the
+ * consumers named above are the full set across all three and common.hpp
+ * exists only in the flight-controller tree. Keep the copies byte-identical:
+ * every one of those classes is built against all of them.
  */
 
 #ifndef COMMON_MATHTYPES_HPP_
