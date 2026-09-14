@@ -1970,8 +1970,6 @@ void ESEKF::setGlitchRadius(float radius_m)
 {
 	glitch_radius_ = (std::isfinite(radius_m) && radius_m > 0.0f) ? radius_m : 0.0f;
 }
-float ESEKF::getGlitchRadius() const        { return glitch_radius_; }
-
 // ---------------------------------------------------------------------------
 // updateMagnetometer(): corrects yaw (and, weakly, roll/pitch) using the
 // reference field mag_ref_ computed at inilialize(). No mag bias state is
@@ -2484,42 +2482,8 @@ void ESEKF::setGyroBias(const Vector3f &b0) { if (isFiniteVec(b0)) gyro_bias = b
 void ESEKF::setAccelBias(const Vector3f &b0) { if (isFiniteVec(b0)) accel_bias = b0; }
 
 // ---------------------------------------------------------------------------
-// Covariance getters / setters
+// Covariance access
 // ---------------------------------------------------------------------------
-void ESEKF::getCovariance(float P_out[ESEKF_STATE_DIM][ESEKF_STATE_DIM]) const
-{
-	std::memcpy(P_out, P, sizeof(P));
-}
-
-// Accepted only if every entry is finite and the diagonal is non-negative --
-// the cheap necessary conditions for a covariance. (Full positive-definiteness
-// would need an eigen or Cholesky check; that is the caller's business, and
-// the Joseph-form updates below stay PSD from any PSD starting point.)
-//
-// The copy is symmetrized on the way in for the same reason predict() and the
-// updates symmetrize on the way out: an asymmetric P is not the covariance of
-// anything, and the asymmetry compounds through every subsequent F P F^T.
-void ESEKF::setCovariance(const float P_in[ESEKF_STATE_DIM][ESEKF_STATE_DIM])
-{
-	for (int i = 0; i < ESEKF_STATE_DIM; ++i)
-	{
-		if (!std::isfinite(P_in[i][i]) || P_in[i][i] < 0.0f)
-		{
-			return;
-		}
-		for (int j = 0; j < ESEKF_STATE_DIM; ++j)
-		{
-			if (!std::isfinite(P_in[i][j]))
-			{
-				return;
-			}
-		}
-	}
-
-	std::memcpy(P, P_in, sizeof(P));
-	symmetrizeCovariance();
-}
-
 float ESEKF::getStateVariance(int index) const
 {
 	if (index < 0 || index >= ESEKF_STATE_DIM)
@@ -2680,12 +2644,6 @@ void ESEKF::setGPSVelocityNoiseSigma(float sigma_horizontal, float sigma_vertica
 	R_gps_vel[2][2] = sigma_vertical * sigma_vertical;
 }
 
-void ESEKF::getAccelNoise(float R_out[3][3]) const { std::memcpy(R_out, R_accel, sizeof(R_accel)); }
-void ESEKF::getMagNoise(float R_out[3][3]) const   { std::memcpy(R_out, R_mag, sizeof(R_mag)); }
-float ESEKF::getBaroNoise() const                  { return R_baro; }
-void ESEKF::getGPSNoise(float R_out[3][3]) const   { std::memcpy(R_out, R_gps, sizeof(R_gps)); }
-void ESEKF::getGPSVelocityNoise(float R_out[3][3]) const { std::memcpy(R_out, R_gps_vel, sizeof(R_gps_vel)); }
-
 // A NaN threshold would make the motion gate's comparison false for every
 // sample, i.e. the accelerometer would be fused as an attitude reference
 // throughout every maneuver -- the exact failure the gate exists to prevent.
@@ -2714,13 +2672,11 @@ void ESEKF::setInnovationGate(float nis_threshold)
 	if (!std::isfinite(nis_threshold)) return;
 	nis_gate_ = nis_threshold;
 }
-float ESEKF::getInnovationGate() const             { return nis_gate_; }
 
 // Gravity is used both as the accelerometer's predicted measurement and as the
 // centre of its motion gate, so a NaN here disables the gate AND poisons the
 // innovation on the same update.
 void ESEKF::setGravity(const Vector3f &g0)        { if (isFiniteVec(g0)) g = g0; }
-Vector3f ESEKF::getGravity() const                { return g; }
 void ESEKF::setMagReference(const Vector3f &mag_ref) { if (isFiniteVec(mag_ref)) mag_ref_ = mag_ref; }
 void ESEKF::setMagneticDeclination(float declination_rad)
 {

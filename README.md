@@ -638,8 +638,6 @@ void resetVerticalPositionTo(float down_m, float variance);
 ### Covariance, process and measurement noise
 
 ```cpp
-void  getCovariance(float P_out[15][15]) const;
-void  setCovariance(const float P_in[15][15]);
 float getStateVariance(int index) const;        // index in [0, 15)
 
 void setProcessNoiseGyro(float sigma2);
@@ -656,15 +654,24 @@ void setBaroNoise (float variance);
 void setGPSNoise  (const float R[3][3]);
 void setGPSVelocityNoise(const float R[3][3]);
 void setGPSVelocityNoiseSigma(float sigma_h, float sigma_v);  // m/s
+
+float getGyroNoiseDensity()     const;
+float getAccelNoiseDensity()    const;
+float getGyroBiasRandomWalk()   const;
+float getAccelBiasRandomWalk()  const;
 ```
 
-Matching getters exist for all of these.
+The process-noise densities read back through the four getters above, and the
+two spellings stay consistent: `setImuNoiseParameters()` and the four
+`setProcessNoise*()` setters each update Q *and* the densities, so what you read
+back always describes the Q in use. The measurement-noise setters are
+write-only -- nothing in the filter or its consumers reads them back, so no
+getters are carried for them.
 
 ### Reference and environment
 
 ```cpp
 void     setGravity(const Vector3f &g0);
-Vector3f getGravity() const;
 void     setMagReference(const Vector3f &mag_ref);
 Vector3f getMagReference() const;
 void     setMagneticDeclination(float declination_rad);   // before initialize()
@@ -716,7 +723,7 @@ on `__FAST_MATH__`, so this fails the build rather than the flight.
 
 | Property | Value |
 |---|---|
-| `sizeof(ESEKF)` | 2352 bytes — fits in `.bss`, safe at file scope |
+| `sizeof(ESEKF)` | 2328 bytes — fits in `.bss`, safe at file scope |
 | Peak stack | ~1.2 kB, in the GPS/mag update path |
 | Dynamic allocation | none |
 | Exceptions / RTTI / virtuals / globals / I/O | none |

@@ -182,7 +182,6 @@ public:
 	// routine re-centering from a teleport and failsafe instead of flying to a
 	// waypoint in a frame that just moved 500 m.
 	void setGlitchRadius(float radius_m);
-	float getGlitchRadius() const;
 
 	// ---- Predict / update ----
 	// dt is clamped to (0, ESEKF_MAX_PREDICT_DT]; non-finite inputs are rejected.
@@ -297,9 +296,7 @@ public:
 	void setGyroBias(const Vector3f &b0);
 	void setAccelBias(const Vector3f &b0);
 
-	// ---- Covariance getters / setters ----
-	void getCovariance(float P_out[ESEKF_STATE_DIM][ESEKF_STATE_DIM]) const;
-	void setCovariance(const float P_in[ESEKF_STATE_DIM][ESEKF_STATE_DIM]);
+	// ---- Covariance ----
 	float getStateVariance(int index) const; // P[index][index], index in [0, 15)
 
 	// ---- Process noise getters / setters ----
@@ -328,7 +325,7 @@ public:
 	float getGyroBiasRandomWalk() const;
 	float getAccelBiasRandomWalk() const;
 
-	// ---- Measurement noise getters / setters ----
+	// ---- Measurement noise setters ----
 	void setAccelNoise(const float R[3][3]);
 
 	// Magnetometer noise, as a covariance in the sensor's own field units --
@@ -346,11 +343,6 @@ public:
 	// it (EK3_VELNE_M_NSE / EK3_VELD_M_NSE). Arguments are standard deviations
 	// in m/s; squared internally.
 	void setGPSVelocityNoiseSigma(float sigma_horizontal, float sigma_vertical);
-	void getAccelNoise(float R_out[3][3]) const;
-	void getMagNoise(float R_out[3][3]) const;
-	float getBaroNoise() const;
-	void getGPSNoise(float R_out[3][3]) const;
-	void getGPSVelocityNoise(float R_out[3][3]) const;
 
 	// Motion gate for updateAccelerometer(): the update is skipped whenever
 	// |accel| deviates from local gravity magnitude by more than this many
@@ -382,7 +374,6 @@ public:
 
 	// ---- Reference / environment getters / setters ----
 	void setGravity(const Vector3f &g0);
-	Vector3f getGravity() const;
 	void setMagReference(const Vector3f &mag_ref);
 	Vector3f getMagReference() const;
 
@@ -432,7 +423,6 @@ public:
 	// out of the state. Units: chi-square with dim(z) degrees of freedom; the
 	// default is a deliberately loose gate. Set <= 0 to disable gating.
 	void setInnovationGate(float nis_threshold);
-	float getInnovationGate() const;
 
 private:
 	// State vector
