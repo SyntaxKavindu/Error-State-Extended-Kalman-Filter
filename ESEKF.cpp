@@ -957,9 +957,9 @@ bool ESEKF::matrixInverse3x3(const float A[3][3], float A_inv_out[3][3]) const
 // ---------------------------------------------------------------------------
 void ESEKF::injectErrorState(const float dx[ESEKF_STATE_DIM])
 {
-	// Public entry point, so the correction is not necessarily one this filter
-	// produced. A single non-finite element would be spread across the whole
-	// nominal state by the quaternion product below.
+	// The correction is not necessarily one this filter produced -- resets and
+	// future callers reach this too -- and a single non-finite element would be
+	// spread across the whole nominal state by the quaternion product below.
 	for (int i = 0; i < ESEKF_STATE_DIM; ++i)
 	{
 		if (!std::isfinite(dx[i]))
@@ -1732,6 +1732,25 @@ bool ESEKF::gateRecoveryDue(double last_fuse_t, double last_reject_t) const
 	{
 		return false; // nothing has been rejected yet
 	}
+
+	// The source must be in an ACTIVE rejection streak: its most recent event
+	// has to be a rejection, not a successful fusion. Testing only the time
+	// since the last fusion is not enough, because a reject timestamp is never
+	// cleared by a later success -- so a single rejection at any point in the
+	// past would arm this permanently, and the next gap in the data (a sensor
+	// dropout, a task stall, a slow update rate) would then force-fuse whatever
+	// sample happened to arrive next, gate and all. Measured before this check
+	// existed: one stale rejection, two seconds of healthy fusion, a three
+	// second data gap, and a magnetometer sample 3000x outside the gate was
+	// fused and slewed yaw by 178 degrees.
+	//
+	// This mirrors the test getStatus() already uses for gps_glitching
+	// (last_gps_pos_reject_t_ > last_gps_pos_fuse_t_).
+	if (last_reject_t <= last_fuse_t)
+	{
+		return false; // the source is currently being fused, not locked out
+	}
+
 	// Time since the source last actually contributed. A source that has never
 	// been fused but is being rejected also qualifies.
 	const float since_fuse = (float)(filter_time_ - last_fuse_t);
@@ -2192,7 +2211,19 @@ bool ESEKF::updateGPSPrecise(double latitude_rad, double longitude_rad, float al
 	{
 		return false;
 	}
-	if (!std::isfinite(latitude_rad) || !std::isfinite(longitude_rad) || !std::isfinite(altitude_m))
+	// Range-checked with the SAME predicate setGPSReferencePrecise() uses, not
+	// merely screened for finiteness. An out-of-range angle means the caller's
+	// units are wrong -- passing degrees to this radians API is the documented
+	// foot-gun -- and letting one through is not a harmless scale error here.
+	// It produces an innovation of millions of metres, which the gate rejects;
+	// the rejection then trips the aiding timeout below and SNAPS the state to
+	// the bad measurement via resetPositionTo(). Once snapped, every subsequent
+	// sample agrees with the state, so the filter fuses happily and reports
+	// horiz_pos_valid with a sub-metre sigma at a position thousands of km away.
+	// Rejecting the sample outright instead leaves GPS unaided, which surfaces
+	// as dead_reckoning -- wrong units stay visible rather than becoming a
+	// confident wrong answer.
+	if (!isValidLatLonRad(latitude_rad, longitude_rad) || !std::isfinite(altitude_m))
 	{
 		return false;
 	}
@@ -2505,28 +2536,42 @@ float ESEKF::getStateVariance(int index) const
 // the previous value. A negative process noise makes P shrink every predict()
 // until it goes indefinite; a NaN turns all of P into NaN on the first
 // propagation. Neither is recoverable in flight.
+//
+// Each also mirrors its sigma^2 back into the matching noise-density member.
+// These are two spellings of ONE quantity -- setImuNoiseParameters() squares a
+// density onto the same Q diagonal these write directly -- so a setter that
+// moved only one of them left the getters describing a Q that no longer
+// existed. Measured: setProcessNoiseGyro(0.25) put 0.25 on Q's attitude block
+// while getGyroNoiseDensity() still reported 0.005, i.e. 2.5e-05, four orders
+// of magnitude out. Anything logging or round-tripping tuning through the
+// getters recorded a value that did not describe the filter. The density is
+// the square root by construction, so the mirror is exact.
 void ESEKF::setProcessNoiseGyro(float sigma2)
 {
 	if (!isValidVariance(sigma2)) return;
 	for (int i = 0; i < 3; ++i) Q[i][i] = sigma2;
+	gyro_noise_density_ = std::sqrt(sigma2);
 }
 
 void ESEKF::setProcessNoiseAccel(float sigma2)
 {
 	if (!isValidVariance(sigma2)) return;
 	for (int i = 0; i < 3; ++i) Q[3 + i][3 + i] = sigma2;
+	accel_noise_density_ = std::sqrt(sigma2);
 }
 
 void ESEKF::setProcessNoiseGyroBias(float sigma2)
 {
 	if (!isValidVariance(sigma2)) return;
 	for (int i = 0; i < 3; ++i) Q[9 + i][9 + i] = sigma2;
+	gyro_bias_random_walk_ = std::sqrt(sigma2);
 }
 
 void ESEKF::setProcessNoiseAccelBias(float sigma2)
 {
 	if (!isValidVariance(sigma2)) return;
 	for (int i = 0; i < 3; ++i) Q[12 + i][12 + i] = sigma2;
+	accel_bias_random_walk_ = std::sqrt(sigma2);
 }
 
 void ESEKF::getProcessNoise(float Q_out[ESEKF_STATE_DIM][ESEKF_STATE_DIM]) const
