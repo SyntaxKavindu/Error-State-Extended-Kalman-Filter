@@ -14,9 +14,11 @@ struct Matrix3f {
     float m[3][3];
 
     static Matrix3f identity() {
+        // Matrix3f has no user-provided constructor, so `Matrix3f r{}` is a
+        // value-initialisation that already zeroes every element; only the
+        // diagonal is left to write.
         Matrix3f r{};
         r.m[0][0] = r.m[1][1] = r.m[2][2] = 1.0f;
-        r.m[0][1] = r.m[0][2] = r.m[1][0] = r.m[1][2] = r.m[2][0] = r.m[2][1] = 0.0f;
         return r;
     }
 
