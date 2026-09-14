@@ -272,12 +272,6 @@ public:
 	void resetVelocityTo(const Vector3f &velocity_ned, float variance);
 	void resetVerticalPositionTo(float down_m, float variance);
 
-	// ---- Error-state injection ----
-	// Injects a 15x1 error state (dx) into the nominal state. dx is produced
-	// and consumed within a single update (K * innovation -> inject -> discard),
-	// so it is passed in rather than stored as a member.
-	void injectErrorState(const float dx[ESEKF_STATE_DIM]);
-
 	// ---- State getters ----
 	Quaternionf getOrientation() const;
 	Vector3f getEulerAngles() const;      // roll, pitch, yaw (rad) -> returned as x,y,z
@@ -493,8 +487,6 @@ private:
 	Vector3f    last_good_accel_bias_;
 	bool        have_last_good_;  // false until the first healthy check after alignment
 	uint32_t    fault_count_;     // repairs performed; see getFaultCount()
-	float dt_last_;
-	float altitude_;    // last raw barometer altitude reading (not the filter's estimate -- see getAltitude())
 	float baro_ref_;    // barometer datum -- the raw reading at initialize(). See setBaroReference().
 	float nis_gate_;    // innovation gate threshold. See setInnovationGate().
 	float mag_declination_; // radians, positive east. See setMagneticDeclination().
@@ -528,9 +520,13 @@ private:
 	double last_gps_vel_fuse_t_;
 	double last_baro_fuse_t_;
 	double last_mag_fuse_t_;
-	double last_gps_pos_reject_t_; // last time a GPS position sample was GATED OUT
-	double last_gps_vel_reject_t_;
-	double last_baro_reject_t_;
+	// Last time a GPS position sample was GATED OUT. Only the sources whose
+	// rejection history is actually consumed keep one: GPS position drives
+	// ESEKFStatus::gps_glitching, and the magnetometer drives gateRecoveryDue().
+	// Barometer and GPS velocity escape a gate lockout through a state reset
+	// (see updateBarometer()/updateGPSVelocity()) rather than forced fusion, so
+	// they need no reject stamp.
+	double last_gps_pos_reject_t_;
 	double last_mag_reject_t_;
 
 	// Most recent normalized test ratios (innovation^2 / gate). 1.0 = on the gate.
@@ -547,7 +543,6 @@ private:
 
 	// ---- Helper functions: quaternion operations (stateless -- const) ----
 	Quaternionf quaternionMultiply(const Quaternionf &q1, const Quaternionf &q2) const;
-	Quaternionf quaternionConjugate(const Quaternionf &q) const;
 	Quaternionf quaternionNormalize(const Quaternionf &q) const;
 	Quaternionf quaternionFromEuler(float roll, float pitch, float yaw) const;
 	// Exact exponential map SO(3) <- R^3. Replaces the previous first-order
@@ -555,14 +550,12 @@ private:
 	// per step and cannot represent a large error-state correction.
 	Quaternionf quaternionFromRotationVector(const Vector3f &delta_theta) const;
 	Vector3f eulerFromQuaternion(const Quaternionf &q) const;
-	Vector3f rotateVector(const Quaternionf &q, const Vector3f &v) const;
 	void quaternionToRotationMatrix(const Quaternionf &q, float R_out[3][3]) const;
 
 	// ---- Helper functions: linear algebra (stateless -- const) ----
 	Vector3f vectorAdd(const Vector3f &a, const Vector3f &b) const;
 	Vector3f vectorSub(const Vector3f &a, const Vector3f &b) const;
 	Vector3f vectorScale(const Vector3f &a, float s) const;
-	Vector3f crossProduct(const Vector3f &a, const Vector3f &b) const;
 	float vectorNorm(const Vector3f &a) const;
 	void skewSymmetric(const Vector3f &v, float M_out[3][3]) const;
 
@@ -618,6 +611,16 @@ private:
 	void resetStateBlockCovariance(int first, int last, float variance);
 
 	void resetCovarianceDefaults(); // sets P to the default diagonal (used by both the constructor and inilialize())
+
+	// Injects a 15x1 error state (dx) into the nominal state. dx is produced
+	// and consumed within a single update (K * innovation -> inject -> discard),
+	// so it is passed in rather than stored as a member.
+	//
+	// PRIVATE deliberately. On its own this folds dx into the nominal state and
+	// does NOT apply the covariance reset that must accompany it, so a caller
+	// reaching it directly leaves P describing an error state that has already
+	// been consumed. Go through injectAndResetCovariance() below.
+	void injectErrorState(const float dx[ESEKF_STATE_DIM]);
 
 	// Folds the error state into the nominal state AND applies the ESEKF
 	// covariance reset P <- G P G^T. Every update path goes through this rather

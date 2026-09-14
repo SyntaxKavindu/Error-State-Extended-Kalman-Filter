@@ -224,8 +224,6 @@ ESEKF::ESEKF()
 
 	initialized_ = false;
 	diverged_    = false;
-	dt_last_     = 0.0f;
-	altitude_    = 0.0f;
 	baro_ref_    = 0.0f;
 	nis_gate_    = kDefaultNisGate;
 	mag_declination_ = 0.0f;
@@ -243,8 +241,6 @@ ESEKF::ESEKF()
 	last_baro_fuse_t_      = kNeverFused;
 	last_mag_fuse_t_       = kNeverFused;
 	last_gps_pos_reject_t_ = kNeverFused;
-	last_gps_vel_reject_t_ = kNeverFused;
-	last_baro_reject_t_    = kNeverFused;
 	last_mag_reject_t_     = kNeverFused;
 
 	pos_test_ratio_ = 0.0f;
@@ -311,15 +307,6 @@ float ESEKF::vectorNorm(const Vector3f &a) const
 	return std::sqrt(a.x * a.x + a.y * a.y + a.z * a.z);
 }
 
-Vector3f ESEKF::crossProduct(const Vector3f &a, const Vector3f &b) const
-{
-	return Vector3f{
-		a.y * b.z - a.z * b.y,
-		a.z * b.x - a.x * b.z,
-		a.x * b.y - a.y * b.x
-	};
-}
-
 Quaternionf ESEKF::quaternionNormalize(const Quaternionf &q_in) const
 {
 	float n = std::sqrt(q_in.w * q_in.w + q_in.x * q_in.x +
@@ -344,11 +331,6 @@ Quaternionf ESEKF::quaternionMultiply(const Quaternionf &q1, const Quaternionf &
 	};
 }
 
-Quaternionf ESEKF::quaternionConjugate(const Quaternionf &q_in) const
-{
-	return Quaternionf{q_in.w, -q_in.x, -q_in.y, -q_in.z};
-}
-
 // Roll/pitch/yaw (rad, body 3-2-1 Euler) -> orientation quaternion (body -> NED)
 Quaternionf ESEKF::quaternionFromEuler(float roll, float pitch, float yaw) const
 {
@@ -363,16 +345,6 @@ Quaternionf ESEKF::quaternionFromEuler(float roll, float pitch, float yaw) const
 	out.z = cr * cp * sy - sr * sp * cy;
 
 	return quaternionNormalize(out);
-}
-
-// Rotates v from body frame to NED frame using q (body -> NED).
-Vector3f ESEKF::rotateVector(const Quaternionf &q_in, const Vector3f &v) const
-{
-	Quaternionf v_quat{0.0f, v.x, v.y, v.z};
-	Quaternionf q_conj = quaternionConjugate(q_in);
-	Quaternionf result = quaternionMultiply(quaternionMultiply(q_in, v_quat), q_conj);
-
-	return Vector3f{result.x, result.y, result.z};
 }
 
 // ---------------------------------------------------------------------------
@@ -487,7 +459,6 @@ void ESEKF::initialize(const Vector3f &accel, const Vector3f &mag, float altitud
 	// NED frame; the filter starts at that origin by definition.
 	setGPSReferencePrecise((double)gps.x, (double)gps.y, gps.z);
 	position_NED_   = {0.0f, 0.0f, 0.0f}; // local NED origin -- absolute altitude is reconstructed via gps_ref_.z (see getAltitude())
-	altitude_       = altitude;
 
 	// --- Barometric datum ---
 	// The barometer's own first reading is the reference the barometer residual
@@ -517,8 +488,8 @@ void ESEKF::initialize(const Vector3f &accel, const Vector3f &mag, float altitud
 
 	// --- Magnetic reference: this is what makes yaw absolute or relative ---
 	//
-	// The obvious construction, mag_ref_ = rotateVector(q, mag), rotates the
-	// first sample through the attitude that was just derived FROM that same
+	// The obvious construction -- rotate the first sample into NED with q --
+	// puts that sample through the attitude that was just derived FROM that same
 	// sample. The result is self-consistent by construction: the very first
 	// magnetometer innovation is identically zero, and it stays zero for any
 	// initial yaw whatsoever. The magnetometer then only holds yaw wherever
@@ -549,7 +520,6 @@ void ESEKF::initialize(const Vector3f &accel, const Vector3f &mag, float altitud
 	// --- Reset covariance to initial uncertainty ---
 	resetCovarianceDefaults();
 
-	dt_last_     = 0.0f;
 	diverged_    = false;
 
 	// Restart the aiding clock: nothing has been fused against this alignment.
@@ -559,8 +529,6 @@ void ESEKF::initialize(const Vector3f &accel, const Vector3f &mag, float altitud
 	last_baro_fuse_t_      = kNeverFused;
 	last_mag_fuse_t_       = kNeverFused;
 	last_gps_pos_reject_t_ = kNeverFused;
-	last_gps_vel_reject_t_ = kNeverFused;
-	last_baro_reject_t_    = kNeverFused;
 	last_mag_reject_t_     = kNeverFused;
 	pos_test_ratio_ = 0.0f;
 	vel_test_ratio_ = 0.0f;
@@ -877,7 +845,6 @@ void ESEKF::predict(const Vector3f &gyro, const Vector3f &accel, float dt)
 	// F is applied in structured form, never built -- see predictCovariance().
 	predictCovariance(omega, f, R_mid, dt);
 
-	dt_last_ = dt;
 	filter_time_ += (double)dt; // monotonic filter clock, drives every aiding timeout
 	checkFinite();
 }
@@ -1225,7 +1192,6 @@ bool ESEKF::checkFinite()
 	angular_rate_ = {0.0f, 0.0f, 0.0f}; // stale rate must not reach a rate controller
 
 	resetCovarianceDefaults();
-	dt_last_ = 0.0f;
 
 	return false;
 }
@@ -2152,8 +2118,6 @@ bool ESEKF::updateBarometer(float altitude)
 	const float z_pred     = -position_NED_.z;      // predicted climb (up-positive)
 	const float innovation = rel_alt - z_pred;
 
-	altitude_ = altitude;
-
 	// H is 1x15 with H[pz_idx] = -1 (z = -p_z), zero elsewhere.
 	const bool fused = kalmanUpdateScalar(innovation, pz_idx, -1.0f, R_baro, false);
 
@@ -2166,8 +2130,6 @@ bool ESEKF::updateBarometer(float altitude)
 
 	if (last_update_gated_)
 	{
-		last_baro_reject_t_ = filter_time_;
-
 		if (sourceTimedOut(last_baro_fuse_t_, ESEKF_HGT_AID_TIMEOUT))
 		{
 			resetVerticalPositionTo(-rel_alt, (R_baro > 0.0f) ? R_baro : 1.0f);
@@ -2339,8 +2301,6 @@ bool ESEKF::updateGPSVelocity(const Vector3f &velocity_ned)
 
 	if (last_update_gated_)
 	{
-		last_gps_vel_reject_t_ = filter_time_;
-
 		if (sourceTimedOut(last_gps_vel_fuse_t_, ESEKF_GPS_AID_TIMEOUT))
 		{
 			const float var = (R_gps_vel[0][0] > 0.0f) ? R_gps_vel[0][0] : 1.0f;
@@ -2388,8 +2348,6 @@ void ESEKF::reset()
 
 	resetCovarianceDefaults();
 
-	dt_last_     = 0.0f;
-	altitude_    = 0.0f;
 	baro_ref_    = 0.0f;
 	initialized_ = false;
 	diverged_    = false;
@@ -2409,8 +2367,6 @@ void ESEKF::reset()
 	last_baro_fuse_t_      = kNeverFused;
 	last_mag_fuse_t_       = kNeverFused;
 	last_gps_pos_reject_t_ = kNeverFused;
-	last_gps_vel_reject_t_ = kNeverFused;
-	last_baro_reject_t_    = kNeverFused;
 	last_mag_reject_t_     = kNeverFused;
 	pos_test_ratio_ = 0.0f;
 	vel_test_ratio_ = 0.0f;
@@ -2472,9 +2428,9 @@ Vector3f ESEKF::getGPSPosition() const
 Vector3f ESEKF::getGyroBias() const { return gyro_bias; }
 Vector3f ESEKF::getAccelBias() const { return accel_bias; }
 Vector3f ESEKF::getAngularRate() const { return angular_rate_; }
-// Derived from position_NED_, not the stale altitude_ member -- predict()
-// continuously propagates position but does not touch altitude_, so this
-// keeps getAltitude() consistent with getPosition() between barometer updates.
+// Derived from position_NED_ rather than from the last raw barometer reading:
+// predict() propagates position continuously between barometer updates, so this
+// keeps getAltitude() consistent with getPosition() at every call.
 float ESEKF::getAltitude() const { return gps_ref_.z - position_NED_.z; } // absolute altitude = reference + relative climb
 
 // These write the nominal state directly, bypassing every estimator path, so
