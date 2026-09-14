@@ -56,8 +56,9 @@ constexpr float ESEKF_GPS_AID_TIMEOUT   = 5.0f; // ... this long -> position aid
 constexpr float ESEKF_HGT_AID_TIMEOUT   = 5.0f; // no fused baro/GPS height for this long -> height aiding lost
 constexpr float ESEKF_MAG_AID_TIMEOUT   = 5.0f; // no fused magnetometer for this long -> yaw unaided
 
-// After a source has been gated out continuously for this long, the next sample
-// is fused REGARDLESS of the gate. Straight from EKF3, which fuses on
+// After a source has been gated out CONTINUOUSLY for this long -- its most
+// recent event is a rejection, not a fusion -- the next sample is fused
+// REGARDLESS of the gate. Straight from EKF3, which fuses on
 // `(posCheckPassed || posTimeout || badIMUdata)`. Without this escape a single
 // large transient -- a GPS jump, a hard landing, a magnetic slam -- can push the
 // state so far from the measurement that every subsequent sample fails the gate
@@ -212,9 +213,15 @@ public:
 
 	// gps = {latitude, longitude, altitude}. UNITS: lat/lon in RADIANS, altitude
 	// in metres. Most GPS drivers (NMEA, u-blox UBX-NAV-PVT) emit DEGREES --
-	// use updateGPSDegrees() for those, or convert at the call site. Passing
-	// degrees here produces a silent ~57x position scale error, so choose
-	// deliberately. initialize()'s `gps` argument uses the same units.
+	// use updateGPSDegrees() for those, or convert at the call site.
+	// initialize()'s `gps` argument uses the same units.
+	//
+	// An out-of-range angle is REJECTED (returns false) rather than fused, so
+	// feeding this degrees leaves GPS unaided and raises dead_reckoning instead
+	// of quietly relocating the vehicle. A degree value that happens to fall
+	// inside the valid radian range still reads as a legitimate position, so
+	// this is a backstop, not a units detector -- choose the entry point
+	// deliberately.
 	bool updateGPS(const Vector3f &gps);
 
 	// As updateGPS(), but takes {latitude(deg), longitude(deg), altitude(m)}.
@@ -305,6 +312,11 @@ public:
 	// Preferred way to set Q: from IMU datasheet noise-density figures rather
 	// than hand-picked sigma^2 values. Squares each input internally and
 	// writes the result onto Q's diagonal.
+	//
+	// This and the four setProcessNoise* setters above are two spellings of the
+	// same quantity and stay consistent in both directions: either one updates
+	// Q AND the density getters below, so what you read back always describes
+	// the Q actually in use.
 	//   gyro_noise_density   : (rad/s)/sqrt(Hz)   -- "angular random walk"
 	//   accel_noise_density  : (m/s^2)/sqrt(Hz)   -- "velocity random walk"
 	//   gyro_bias_random_walk: (rad/s)/sqrt(s)    -- "bias instability"
