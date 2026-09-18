@@ -55,6 +55,12 @@ constexpr float ESEKF_GPS_USE_TIMEOUT   = 4.0f; // no fused GPS for this long ->
 constexpr float ESEKF_GPS_AID_TIMEOUT   = 5.0f; // ... this long -> position aiding lost, dead reckoning
 constexpr float ESEKF_HGT_AID_TIMEOUT   = 5.0f; // no fused baro/GPS height for this long -> height aiding lost
 constexpr float ESEKF_MAG_AID_TIMEOUT   = 5.0f; // no fused magnetometer for this long -> yaw unaided
+// No fused accelerometer OR GPS velocity for this long -> roll and pitch are
+// unaided and running on raw gyro. Those are the only two measurements that
+// observe tilt: gravity directly, GPS velocity through the acceleration it
+// implies. The magnetometer cannot help -- it is fused as heading only and is
+// structurally immune to roll and pitch by design.
+constexpr float ESEKF_ATT_AID_TIMEOUT   = 5.0f;
 
 // After a source has been gated out CONTINUOUSLY for this long -- its most
 // recent event is a rejection, not a fusion -- the next sample is fused
@@ -87,6 +93,15 @@ struct ESEKFStatus
 	bool position_reset;    // position was snapped to a measurement recently --
 	                        // the estimate is DISCONTINUOUS, see getLastPositionResetDelta()
 	bool mag_aiding;        // magnetometer fusing, i.e. yaw is bounded
+	bool attitude_aiding;   // roll/pitch are being CORRECTED by a measurement --
+	                        // accelerometer or GPS velocity fused recently. False
+	                        // means tilt is dead reckoning on raw gyro and drifting
+	                        // with its bias, while attitude_valid stays true: the
+	                        // estimate is still finite and usable, just no longer
+	                        // anchored. On a GPS-less build the accelerometer is
+	                        // the ONLY thing holding it, and a vibration floor or
+	                        // sustained manoeuvring that keeps the motion gate
+	                        // closed will silently take it away.
 	bool initialized;       // initialize() completed successfully
 	bool diverged;          // state or covariance went non-finite; filter is dead
 };
@@ -136,6 +151,10 @@ public:
 	float getTimeSinceGPSFusion() const;
 	float getTimeSinceBaroFusion() const;
 	float getTimeSinceMagFusion() const;
+	// Since the accelerometer last passed BOTH the motion gate and the
+	// innovation gate. Every other source records this; without it a filter
+	// flying on a closed motion gate looks healthy from the outside.
+	float getTimeSinceAccelFusion() const;
 
 	// Normalized innovation test ratios from the most recent attempt at each
 	// source: 1.0 means the innovation sat exactly on the gate, > 1.0 means the
@@ -185,7 +204,21 @@ public:
 
 	// ---- Predict / update ----
 	// dt is clamped to (0, ESEKF_MAX_PREDICT_DT]; non-finite inputs are rejected.
-	void predict(const Vector3f &gyro, const Vector3f &accel, float dt);
+	//
+	// update_follows: set it when a measurement update is going to run before
+	// the next predict(). P is symmetrized at the end of covariance propagation
+	// AND at the end of every update, so on a cycle that does both the first of
+	// those is immediately redone. Passing true skips it and lets the update's
+	// own symmetrize cover both.
+	//
+	// It is NOT simply removable. On a cycle with no update -- a bare
+	// propagation between sensor samples, which is most cycles at IMU rate --
+	// nothing else would symmetrize P at all, and the float32 asymmetry that
+	// F P F^T accumulates would then compound through every subsequent step
+	// with nothing to correct it. Defaults to false so an existing caller keeps
+	// the current behaviour exactly.
+	void predict(const Vector3f &gyro, const Vector3f &accel, float dt,
+	              bool update_follows = false);
 
 	// Each update returns false if it was rejected -- not initialized, diverged,
 	// non-finite input, blocked by the motion gate, or blocked by the innovation
@@ -360,8 +393,15 @@ public:
 	// vehicle, read this, and set the gate just above the value it settles at.
 	float getAccelMotion() const;
 
-	// Variance multiplier R_accel was scaled by for the most recently FUSED
-	// accelerometer sample; sqrt() it for the sigma multiplier. Always >= 1.
+	// Variance multiplier R_accel was scaled by, from the most recent
+	// accelerometer ATTEMPT -- fused or gated out; sqrt() it for the sigma
+	// multiplier. Always >= 1, and above 10 exactly when the sample fell
+	// outside the motion gate, since the ratio is not clamped there.
+	//
+	// Reported for a gated sample as well as a fused one because a vehicle
+	// whose vibration floor is holding the gate shut is precisely when this
+	// number is worth reading, and reporting the last FUSED sample's value
+	// then describes a sample that may be seconds old.
 	//
 	// A bare threshold is a cliff: a sample just inside it is trusted in full
 	// and one just outside is thrown away entirely, so a vehicle sitting near
@@ -530,12 +570,42 @@ private:
 	// they need no reject stamp.
 	double last_gps_pos_reject_t_;
 	double last_mag_reject_t_;
+	// The accelerometer keeps both stamps for the same reason the magnetometer
+	// does: it is an aiding source whose failure is otherwise invisible. The
+	// reject stamp is recorded but deliberately NOT wired to gateRecoveryDue()
+	// -- see updateAccelerometer().
+	double last_accel_fuse_t_;
+	double last_accel_reject_t_;
+	// The barometer's rejection history, which drives its gateRecoveryDue()
+	// escape. Forced fusion fires first; the vertical reset in
+	// updateBarometer() remains the stronger fallback behind it.
+	double last_baro_reject_t_;
+
+	// Set when a GPS position timeout snapped position to the measurement.
+	// Position drifted BECAUSE velocity was wrong, so the velocity estimate is
+	// suspect too -- and resetStateBlockCovariance(6,8,...) has just zeroed the
+	// position<->velocity cross-covariance, so the filter cannot even use the
+	// size of the jump to infer the velocity error. The next GPS velocity
+	// sample is therefore reset to rather than fused with; see
+	// updateGPSVelocity().
+	bool pending_velocity_reset_;
 
 	// Most recent normalized test ratios (innovation^2 / gate). 1.0 = on the gate.
 	float pos_test_ratio_;
 	float vel_test_ratio_;
 	float hgt_test_ratio_;
 	float mag_test_ratio_;
+
+	// Active columns of H for the update in flight, expanded once from
+	// kalmanUpdate()'s col_mask. A MEMBER rather than a local deliberately:
+	// kalmanUpdate() is the deepest frame in the filter and the target's
+	// FreeRTOS task stacks are 1-2 kB, so 15 bytes of scratch belongs in .bss
+	// where it costs no stack at all. Safe because this class is documented
+	// non-reentrant -- one instance belongs to one task -- so only one update
+	// is ever in flight. Written at the top of every kalmanUpdate() call and
+	// never read outside it.
+	uint8_t h_cols_[ESEKF_STATE_DIM];
+	int     h_ncols_;
 
 	// Set by kalmanUpdate()/kalmanUpdateScalar() so the caller-facing update
 	// wrappers can record pass/fail and the test ratio without duplicating the
@@ -578,14 +648,22 @@ private:
 	// task stacks that 1.8 kB is the difference between running and a stack
 	// overflow, and predict() is the highest-rate call in the filter.
 	void predictCovariance(const Vector3f &omega, const Vector3f &f,
-	                        const float R_mid[3][3], float dt);
+	                        const float R_mid[3][3], float dt,
+	                        bool skip_symmetrize);
 
 	// Vector (3-element) and scalar measurement updates. Both use the Joseph
 	// form and both return false if the innovation gate rejected the sample.
 	// force_fuse bypasses the innovation gate. Used only by the timeout recovery
 	// path -- see ESEKF_GATE_RECOVERY_TIMEOUT.
+	// col_mask: bit i set means column i of H may be non-zero. Every caller's H
+	// is non-zero in at most 6 of the 15 columns, and the four H-indexed loops
+	// below sweep all 15, so two thirds of that work is multiplying by a
+	// structural zero. The default fuses exactly as before for any caller that
+	// does not know its own sparsity. A mask that claims FEWER columns than H
+	// actually uses silently drops those terms, so it must be derived from the
+	// H the caller builds, never guessed.
 	bool kalmanUpdate(const float innovation[3], const float H[3][ESEKF_STATE_DIM], const float R[3][3],
-	                   bool force_fuse = false);
+	                   bool force_fuse = false, uint16_t col_mask = 0xFFFF);
 	bool kalmanUpdateScalar(float innovation, int state_index, float h, float r,
 	                         bool force_fuse = false);
 

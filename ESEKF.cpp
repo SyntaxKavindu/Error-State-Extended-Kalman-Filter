@@ -242,6 +242,10 @@ ESEKF::ESEKF()
 	last_mag_fuse_t_       = kNeverFused;
 	last_gps_pos_reject_t_ = kNeverFused;
 	last_mag_reject_t_     = kNeverFused;
+	last_accel_fuse_t_     = kNeverFused;
+	last_accel_reject_t_   = kNeverFused;
+	last_baro_reject_t_    = kNeverFused;
+	pending_velocity_reset_ = false;
 
 	pos_test_ratio_ = 0.0f;
 	vel_test_ratio_ = 0.0f;
@@ -250,6 +254,9 @@ ESEKF::ESEKF()
 
 	last_test_ratio_   = 0.0f;
 	last_update_gated_ = false;
+
+	std::memset(h_cols_, 0, sizeof(h_cols_));
+	h_ncols_ = 0;
 
 	// Reasonable default measurement noise / position process noise so the
 	// filter is usable even if the caller never calls set*Noise(). Unlike P,
@@ -530,6 +537,10 @@ void ESEKF::initialize(const Vector3f &accel, const Vector3f &mag, float altitud
 	last_mag_fuse_t_       = kNeverFused;
 	last_gps_pos_reject_t_ = kNeverFused;
 	last_mag_reject_t_     = kNeverFused;
+	last_accel_fuse_t_     = kNeverFused;
+	last_accel_reject_t_   = kNeverFused;
+	last_baro_reject_t_    = kNeverFused;
+	pending_velocity_reset_ = false;
 	pos_test_ratio_ = 0.0f;
 	vel_test_ratio_ = 0.0f;
 	hgt_test_ratio_ = 0.0f;
@@ -685,7 +696,7 @@ void ESEKF::matrixMultiply3x3(const float A[3][3], const float B[3][3], float C_
 // block anisotropic you must reinstate G and rotate it.
 // ---------------------------------------------------------------------------
 void ESEKF::predictCovariance(const Vector3f &omega, const Vector3f &f,
-                               const float R[3][3], float dt)
+                               const float R[3][3], float dt, bool skip_symmetrize)
 {
 	float S_omega[3][3];
 	skewSymmetric(omega, S_omega);
@@ -768,14 +779,23 @@ void ESEKF::predictCovariance(const Vector3f &omega, const Vector3f &f,
 		P[i][i] += Q[i][i] * dt;
 	}
 
-	symmetrizeCovariance();
+	// Skipped only when the caller has told predict() that an update follows in
+	// the same cycle: every update path symmetrizes P on its way out, so doing
+	// it here as well is the same 105 additions performed twice on the same
+	// matrix. See predict()'s update_follows argument for why it cannot simply
+	// be deleted.
+	if (!skip_symmetrize)
+	{
+		symmetrizeCovariance();
+	}
 }
 
 // ---------------------------------------------------------------------------
 // predict(): propagates the nominal state (strapdown mechanization) and the
 // error-state covariance forward by dt using gyro/accel measurements.
 // ---------------------------------------------------------------------------
-void ESEKF::predict(const Vector3f &gyro, const Vector3f &accel, float dt)
+void ESEKF::predict(const Vector3f &gyro, const Vector3f &accel, float dt,
+                     bool update_follows)
 {
 	if (!initialized_ || diverged_)
 	{
@@ -849,7 +869,7 @@ void ESEKF::predict(const Vector3f &gyro, const Vector3f &accel, float dt)
 
 	// --- Error-state covariance propagation ---
 	// F is applied in structured form, never built -- see predictCovariance().
-	predictCovariance(omega, f, R_mid, dt);
+	predictCovariance(omega, f, R_mid, dt, update_follows);
 
 	filter_time_ += (double)dt; // monotonic filter clock, drives every aiding timeout
 	checkFinite();
@@ -1249,7 +1269,7 @@ bool ESEKF::checkFinite()
 // buffers instead of three.
 // ---------------------------------------------------------------------------
 bool ESEKF::kalmanUpdate(const float innovation[3], const float H[3][ESEKF_STATE_DIM], const float R[3][3],
-                          bool force_fuse)
+                          bool force_fuse, uint16_t col_mask)
 {
 	last_test_ratio_   = 0.0f;
 	last_update_gated_ = false;
@@ -1263,6 +1283,19 @@ bool ESEKF::kalmanUpdate(const float innovation[3], const float H[3][ESEKF_STATE
 		return false;
 	}
 
+	// Expand col_mask once into the list of columns actually present in H. The
+	// alternative -- testing the bit inside each inner loop -- was measured
+	// SLOWER than not exploiting the sparsity at all (updateAccelerometer 8388
+	// cycles against 6652 for the dense sweep): the per-element branch costs
+	// more than the multiply-accumulate it skips and blocks vectorisation of
+	// the loop. Hoisting the test out leaves a dense inner loop over a shorter
+	// list, which is 5313 cycles.
+	h_ncols_ = 0;
+	for (int k = 0; k < ESEKF_STATE_DIM; ++k)
+	{
+		if (col_mask & (uint16_t)(1u << k)) h_cols_[h_ncols_++] = (uint8_t)k;
+	}
+
 	// PHt = P * H^T  (15x3)
 	float PHt[ESEKF_STATE_DIM][3];
 	for (int i = 0; i < ESEKF_STATE_DIM; ++i)
@@ -1270,8 +1303,9 @@ bool ESEKF::kalmanUpdate(const float innovation[3], const float H[3][ESEKF_STATE
 		for (int j = 0; j < 3; ++j)
 		{
 			float sum = 0.0f;
-			for (int k = 0; k < ESEKF_STATE_DIM; ++k)
+			for (int ci = 0; ci < h_ncols_; ++ci)
 			{
+				const int k = h_cols_[ci];
 				sum += P[i][k] * H[j][k]; // H^T[k][j] == H[j][k]
 			}
 			PHt[i][j] = sum;
@@ -1285,8 +1319,9 @@ bool ESEKF::kalmanUpdate(const float innovation[3], const float H[3][ESEKF_STATE
 		for (int j = 0; j < 3; ++j)
 		{
 			float sum = 0.0f;
-			for (int k = 0; k < ESEKF_STATE_DIM; ++k)
+			for (int ci = 0; ci < h_ncols_; ++ci)
 			{
+				const int k = h_cols_[ci];
 				sum += H[i][k] * PHt[k][j];
 			}
 			S[i][j] = sum + R[i][j];
@@ -1387,8 +1422,9 @@ bool ESEKF::kalmanUpdate(const float innovation[3], const float H[3][ESEKF_STATE
 		for (int j = 0; j < ESEKF_STATE_DIM; ++j)
 		{
 			float sum = 0.0f;
-			for (int k = 0; k < ESEKF_STATE_DIM; ++k)
+			for (int ci = 0; ci < h_ncols_; ++ci)
 			{
+				const int k = h_cols_[ci];
 				sum += H[i][k] * P[k][j];
 			}
 			sc.HP[i][j] = sum;
@@ -1417,8 +1453,9 @@ bool ESEKF::kalmanUpdate(const float innovation[3], const float H[3][ESEKF_STATE
 		for (int k = 0; k < 3; ++k)
 		{
 			float sum = 0.0f;
-			for (int j = 0; j < ESEKF_STATE_DIM; ++j)
+			for (int ci = 0; ci < h_ncols_; ++ci)
 			{
+				const int j = h_cols_[ci];
 				sum += P[i][j] * H[k][j]; // H^T[j][k] == H[k][j]
 			}
 			sum -= K[i][0] * R[0][k] + K[i][1] * R[1][k] + K[i][2] * R[2][k];
@@ -1821,13 +1858,28 @@ bool ESEKF::updateAccelerometer(const Vector3f &accel)
 	float R_use[3][3];
 	if (accel_gate_threshold_ > 0.0f)
 	{
+		// Computed BEFORE the gate, for the same reason accel_motion_ is: on a
+		// vehicle whose vibration floor is holding the gate shut this is the
+		// number that says by how much, and leaving it at the last fused
+		// sample's value reported a stale figure exactly when it was needed to
+		// diagnose that. The ratio is deliberately NOT clamped here -- above
+		// 1.0 it reads as "this far outside the gate", which is the diagnostic
+		// content. A sample that passes the gate has ratio <= 1 and so gets
+		// exactly the value it got before, which is why R_use, and with it
+		// every fused result, is unchanged.
+		const float ratio = accel_motion_ / accel_gate_threshold_;
+		accel_inflation_ = 1.0f + kAccelInflationGain * ratio * ratio;
+
 		if (accel_motion_ > accel_gate_threshold_)
 		{
+			// Gated by MOTION, not by the innovation gate: the reading is real
+			// acceleration and is not a gravity reference. Stamped as a
+			// rejection anyway, because for attitude aiding the distinction
+			// does not matter -- either way nothing corrected roll and pitch
+			// this cycle, and that is what the timeout has to see.
+			last_accel_reject_t_ = filter_time_;
 			return false; // real acceleration -- skip, don't corrupt attitude/bias
 		}
-
-		const float ratio = accel_motion_ / accel_gate_threshold_; // [0, 1]
-		accel_inflation_ = 1.0f + kAccelInflationGain * ratio * ratio;
 	}
 	else
 	{
@@ -1871,7 +1923,28 @@ bool ESEKF::updateAccelerometer(const Vector3f &accel)
 		H[i][12 + i] = 1.0f; // d(z)/d(dba)
 	}
 
-	return kalmanUpdate(innovation, H, R_use);
+	// H is non-zero only on the attitude block (columns 0,1,2, from S_v) and
+	// the accelerometer-bias block (columns 12,13,14, one per row). Read off
+	// the loop above, not assumed.
+	//
+	// force_fuse stays false, deliberately, and this is the one aiding source
+	// where that is the right answer. A gated accelerometer sample almost
+	// always means the vehicle really is accelerating, so fusing it anyway
+	// would inject that acceleration into tilt -- the failure the gate exists
+	// to prevent. The other sources measure a quantity that is still true
+	// while they are being rejected; this one does not. The remedy here is to
+	// REPORT that attitude is unaided, via attitude_aiding, not to recover by
+	// fusing something known to be wrong.
+	const bool fused = kalmanUpdate(innovation, H, R_use, false, 0x7007u);
+	if (fused)
+	{
+		last_accel_fuse_t_ = filter_time_;
+	}
+	else if (last_update_gated_)
+	{
+		last_accel_reject_t_ = filter_time_;
+	}
+	return fused;
 }
 
 // ---------------------------------------------------------------------------
@@ -1954,6 +2027,15 @@ ESEKFStatus ESEKF::getStatus() const
 	                     (since_pos_reset < ESEKF_GPS_USE_TIMEOUT);
 
 	st.mag_aiding  = healthy && (since_mag < ESEKF_MAG_AID_TIMEOUT);
+
+	// Roll and pitch are only OBSERVABLE through the accelerometer (gravity) or
+	// GPS velocity (the acceleration it implies). Driven by successful FUSION,
+	// like every other flag here, not by samples arriving: an accelerometer
+	// whose every sample is thrown out by the motion gate is not aiding
+	// anything, and that is the case this exists to make visible.
+	const float since_accel = (float)(filter_time_ - last_accel_fuse_t_);
+	st.attitude_aiding = healthy && ((since_accel < ESEKF_ATT_AID_TIMEOUT) ||
+	                                  (since_gps_vel < ESEKF_ATT_AID_TIMEOUT));
 	st.initialized = initialized_;
 	st.diverged    = diverged_;
 
@@ -1965,6 +2047,7 @@ bool ESEKF::isDeadReckoning() const { return getStatus().dead_reckoning; }
 float ESEKF::getTimeSinceGPSFusion() const  { return (float)(filter_time_ - last_gps_pos_fuse_t_); }
 float ESEKF::getTimeSinceBaroFusion() const { return (float)(filter_time_ - last_baro_fuse_t_); }
 float ESEKF::getTimeSinceMagFusion() const  { return (float)(filter_time_ - last_mag_fuse_t_); }
+float ESEKF::getTimeSinceAccelFusion() const { return (float)(filter_time_ - last_accel_fuse_t_); }
 
 float ESEKF::getGPSPosTestRatio() const { return pos_test_ratio_; }
 float ESEKF::getGPSVelTestRatio() const { return vel_test_ratio_; }
@@ -2162,7 +2245,17 @@ bool ESEKF::updateBarometer(float altitude)
 	const float innovation = rel_alt - z_pred;
 
 	// H is 1x15 with H[pz_idx] = -1 (z = -p_z), zero elsewhere.
-	const bool fused = kalmanUpdateScalar(innovation, pz_idx, -1.0f, R_baro, false);
+	//
+	// Forced fusion on a continuous rejection streak, the same escape the
+	// magnetometer uses. Altitude is a BOUNDED quantity -- the barometer cannot
+	// be more than its own drift away from truth -- so fusing one sample past
+	// the gate takes a real bite out of the error rather than injecting a
+	// wrong one. It fires at ESEKF_GATE_RECOVERY_TIMEOUT, well before the
+	// vertical reset below at ESEKF_HGT_AID_TIMEOUT, so the gentler remedy is
+	// tried first and the reset stays as the fallback for when it was not
+	// enough.
+	const bool force = gateRecoveryDue(last_baro_fuse_t_, last_baro_reject_t_);
+	const bool fused = kalmanUpdateScalar(innovation, pz_idx, -1.0f, R_baro, force);
 
 	hgt_test_ratio_ = last_test_ratio_;
 	if (fused)
@@ -2173,6 +2266,8 @@ bool ESEKF::updateBarometer(float altitude)
 
 	if (last_update_gated_)
 	{
+		last_baro_reject_t_ = filter_time_;
+
 		if (sourceTimedOut(last_baro_fuse_t_, ESEKF_HGT_AID_TIMEOUT))
 		{
 			resetVerticalPositionTo(-rel_alt, (R_baro > 0.0f) ? R_baro : 1.0f);
@@ -2275,7 +2370,8 @@ bool ESEKF::updateGPSPrecise(double latitude_rad, double longitude_rad, float al
 		H[i][6 + i] = 1.0f; // d(position)/d(dp) = I
 	}
 
-	const bool fused = kalmanUpdate(innovation, H, R_gps, false);
+	// H = [0 0 I 0 0]: non-zero only on the position block, columns 6,7,8.
+	const bool fused = kalmanUpdate(innovation, H, R_gps, false, 0x01C0u);
 
 	pos_test_ratio_ = last_test_ratio_;
 	if (fused)
@@ -2299,6 +2395,14 @@ bool ESEKF::updateGPSPrecise(double latitude_rad, double longitude_rad, float al
 			resetPositionTo(gps_pos_ned, var);
 			last_gps_pos_fuse_t_ = filter_time_;
 			pos_test_ratio_      = 0.0f;
+			// Position did not drift on its own: it drifted because velocity
+			// was wrong, and it has now been snapped while velocity has not.
+			// resetStateBlockCovariance(6,8,...) inside resetPositionTo() has
+			// just zeroed the position<->velocity cross-covariance as well, so
+			// the filter cannot even infer the velocity error from the size of
+			// the jump it just made. Arm the next GPS velocity sample to reset
+			// rather than fuse -- see updateGPSVelocity().
+			pending_velocity_reset_ = true;
 			return true;
 		}
 	}
@@ -2335,6 +2439,23 @@ bool ESEKF::updateGPSVelocity(const Vector3f &velocity_ned)
 		return false;
 	}
 
+	// A position timeout reset has just snapped position without touching
+	// velocity. Fusing this sample normally would take only a fraction of the
+	// velocity error -- the gain is set by a covariance that says the velocity
+	// estimate is still good -- and would leave position and velocity
+	// disagreeing about the same instant. Believe the sensor instead, exactly
+	// as the position path just did, and for the same reason: the filter has
+	// established that the state is wrong and the measurement is right.
+	if (pending_velocity_reset_)
+	{
+		const float var = (R_gps_vel[0][0] > 0.0f) ? R_gps_vel[0][0] : 1.0f;
+		resetVelocityTo(velocity_ned, var); // records the delta and its timestamp
+		pending_velocity_reset_ = false;
+		last_gps_vel_fuse_t_    = filter_time_;
+		vel_test_ratio_         = 0.0f;
+		return true;
+	}
+
 	Vector3f innov = vectorSub(velocity_ned, velocity_NED_);
 	float innovation[3] = {innov.x, innov.y, innov.z};
 
@@ -2345,7 +2466,8 @@ bool ESEKF::updateGPSVelocity(const Vector3f &velocity_ned)
 		H[i][3 + i] = 1.0f; // d(velocity)/d(dv) = I
 	}
 
-	const bool fused = kalmanUpdate(innovation, H, R_gps_vel, false);
+	// H = [0 I 0 0 0]: non-zero only on the velocity block, columns 3,4,5.
+	const bool fused = kalmanUpdate(innovation, H, R_gps_vel, false, 0x0038u);
 
 	vel_test_ratio_ = last_test_ratio_;
 	if (fused)
@@ -2423,6 +2545,10 @@ void ESEKF::reset()
 	last_mag_fuse_t_       = kNeverFused;
 	last_gps_pos_reject_t_ = kNeverFused;
 	last_mag_reject_t_     = kNeverFused;
+	last_accel_fuse_t_     = kNeverFused;
+	last_accel_reject_t_   = kNeverFused;
+	last_baro_reject_t_    = kNeverFused;
+	pending_velocity_reset_ = false;
 	pos_test_ratio_ = 0.0f;
 	vel_test_ratio_ = 0.0f;
 	hgt_test_ratio_ = 0.0f;
