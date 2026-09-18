@@ -754,12 +754,18 @@ void ESEKF::predictCovariance(const Vector3f &omega, const Vector3f &f,
 	}
 
 	// ---- Process noise ----
+	// Q is DIAGONAL by construction and the full 15x15 sweep this replaces spent
+	// 210 of its 225 iterations adding a hard zero. Every write to Q in this
+	// translation unit is to Q[i][i] -- setImuNoiseParameters() and all four
+	// setProcessNoise*() setters -- and the constructor memsets the rest, so no
+	// off-diagonal entry is ever assigned. The discarded term was therefore
+	// P[i][j] += 0.0f * dt, which is exactly identity for every finite P[i][j].
+	//
+	// If a future change ever makes a Q block anisotropic, this loop has to go
+	// back to the full sweep along with the G matrix the note above describes.
 	for (int i = 0; i < ESEKF_STATE_DIM; ++i)
 	{
-		for (int j = 0; j < ESEKF_STATE_DIM; ++j)
-		{
-			P[i][j] += Q[i][j] * dt;
-		}
+		P[i][i] += Q[i][i] * dt;
 	}
 
 	symmetrizeCovariance();
