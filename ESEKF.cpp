@@ -1008,6 +1008,26 @@ void ESEKF::injectErrorState(const float dx[ESEKF_STATE_DIM])
 // ---------------------------------------------------------------------------
 void ESEKF::injectAndResetCovariance(const float dx[ESEKF_STATE_DIM])
 {
+	// Screened HERE as well as in injectErrorState(), not instead of it. That
+	// function refuses a non-finite dx and returns, but returning lands back in
+	// this one, which used to carry on and build G out of the same dx: a
+	// non-finite dx[0..2] put NaN into G and the two passes below smeared it
+	// across 56 of the 225 entries of P -- every row, via the column pass --
+	// leaving the filter with a poisoned covariance AND a nominal state that was
+	// correctly left alone. A non-finite element outside the attitude block was
+	// quieter and no better: G stayed finite, so P <- G P G^T was applied in full
+	// for an injection that never happened, and P then described an error state
+	// nothing had consumed. Both are the exact inconsistency this function exists
+	// to prevent, so the two halves have to agree on the input: either both act,
+	// or neither does.
+	for (int i = 0; i < ESEKF_STATE_DIM; ++i)
+	{
+		if (!std::isfinite(dx[i]))
+		{
+			return;
+		}
+	}
+
 	injectErrorState(dx);
 
 	// G_theta = I - 0.5 * [dtheta]x
